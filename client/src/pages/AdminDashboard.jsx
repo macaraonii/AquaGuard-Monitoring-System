@@ -167,11 +167,22 @@ const CRITICAL_BLINK_CSS = `
 }
 `;
 
+// Armband ids look like "CW-001" in the database.
 const formatArmbandId = (index) =>
-  `${ARMBAND_PREFIX}${String(index).padStart(3, '0')}`;
+  `${ARMBAND_PREFIX}-${String(index).padStart(3, '0')}`;
 
 const buildArmbandIds = (count = DEFAULT_ARMBAND_INVENTORY) =>
   Array.from({ length: count }, (_, index) => formatArmbandId(index + 1));
+
+// Canonical form used ONLY for comparing armband ids, so "CW-001", "cw001",
+// "CW 001" and "CW-1" all match each other. Never store this value.
+const normalizeArmbandId = (value) => {
+  const compact = String(value ?? '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '');
+  const match = compact.match(/^([A-Z]*)0*(\d+)$/);
+  return match ? `${match[1]}${match[2]}` : compact;
+};
 
 // Records written by the old ESP32 poll used status "Inactive" for what is now
 // "Offline", so both read as Offline here.
@@ -533,6 +544,81 @@ const parseAssignments = (snapshotValue) => {
     status: value?.status ?? 'Active',
     ...value
   }));
+};
+
+const NO_GUEST_LABEL = 'No guest assigned';
+
+// Alerts carry the armband that triggered them but no guest name.
+const getAlertArmbandId = (alert) =>
+  alert?.armbandID ?? alert?.armbandId ?? alert?.armbandNumber ?? '';
+
+const getAssignedMs = (assignment) => {
+  const ms = toTimestamp(assignment.assignedAt);
+  return Number.isFinite(ms) ? ms : 0;
+};
+
+// Newest assignment first; GA ids break ties (GA8 before GA7).
+const byNewestAssignment = (a, b) => {
+  const timeDiff = getAssignedMs(b) - getAssignedMs(a);
+  if (timeDiff !== 0) {
+    return timeDiff;
+  }
+
+  const aNumber = Number(String(a.id ?? '').match(/(\d+)$/)?.[1] ?? 0);
+  const bNumber = Number(String(b.id ?? '').match(/(\d+)$/)?.[1] ?? 0);
+  return bNumber - aNumber;
+};
+
+// Picks the guest an alert belongs to. `assignmentsByArmband` maps a
+// normalized armband id to every assignment that ever used it, newest first.
+//   - Open alert: the guest currently holding the armband (Active, or Offline
+//     but not yet returned).
+//   - Resolved alert: the guest who had the armband when the alert came in,
+//     so history keeps showing the right person after the armband is reused.
+//   - Fallback: the current holder, then the most recent assignment.
+const findAssignmentForAlert = (alert, assignmentsByArmband) => {
+  const candidates = assignmentsByArmband.get(
+    normalizeArmbandId(getAlertArmbandId(alert))
+  );
+
+  if (!candidates || candidates.length === 0) {
+    return null;
+  }
+
+  const currentHolder = candidates.find(isHeldAssignment) ?? null;
+
+  if (alert.status === 'Open' && currentHolder) {
+    return currentHolder;
+  }
+
+  const alertMs = getAlertMs(alert);
+  if (Number.isFinite(alertMs)) {
+    const assignedAtTheTime = candidates.find(
+      (candidate) => getAssignedMs(candidate) <= alertMs
+    );
+
+    if (assignedAtTheTime) {
+      return assignedAtTheTime;
+    }
+  }
+
+  return currentHolder ?? candidates[0];
+};
+
+// Adds guestName / armbandNumber / assignmentId to an alert so the existing
+// table, preview cards and CSV export can render them directly.
+const withGuestDetails = (alert, assignmentsByArmband) => {
+  const assignment = findAssignmentForAlert(alert, assignmentsByArmband);
+  const assignedName = assignment
+    ? `${assignment.fName ?? ''} ${assignment.lName ?? ''}`.trim()
+    : '';
+
+  return {
+    ...alert,
+    guestName: assignedName || alert.guestName || NO_GUEST_LABEL,
+    armbandNumber: getAlertArmbandId(alert),
+    assignmentId: assignment?.id ?? null
+  };
 };
 
 const getNextAssignmentId = (currentAssignments) => {
@@ -909,7 +995,7 @@ export default function AdminDashboard() {
 
   const heldAssignmentsByArmband = useMemo(() => {
     return monitoredAssignments.reduce((map, assignment) => {
-      const armbandId = String(assignment.armbandID ?? '').trim().toUpperCase();
+      const armbandId = normalizeArmbandId(assignment.armbandID);
 
       if (!armbandId || map.has(armbandId)) {
         return map;
@@ -922,7 +1008,7 @@ export default function AdminDashboard() {
 
   const armbandOptions = useMemo(() => {
     return buildArmbandIds().map((armbandID) => {
-      const holder = heldAssignmentsByArmband.get(armbandID);
+      const holder = heldAssignmentsByArmband.get(normalizeArmbandId(armbandID));
       const guestName = holder
         ? `${holder.fName ?? ''} ${holder.lName ?? ''}`.trim()
         : '';
@@ -938,13 +1024,17 @@ export default function AdminDashboard() {
   }, [heldAssignmentsByArmband]);
 
   const selectedArmbandOption = useMemo(() => {
-    const normalizedId = form.armbandID.trim().toUpperCase();
+    const normalizedId = normalizeArmbandId(form.armbandID);
 
     if (!normalizedId) {
       return null;
     }
 
-    return armbandOptions.find((option) => option.armbandID === normalizedId) ?? null;
+    return (
+      armbandOptions.find(
+        (option) => normalizeArmbandId(option.armbandID) === normalizedId
+      ) ?? null
+    );
   }, [armbandOptions, form.armbandID]);
 
   const availableArmbandOptions = useMemo(
@@ -1004,6 +1094,36 @@ export default function AdminDashboard() {
     };
   }, [alerts]);
 
+  // Every assignment (Active, Offline and Returned) grouped by armband, newest
+  // first. This reuses the live /assignments listener above, so alerts
+  // re-resolve their guest automatically whenever an assignment changes - no
+  // per-alert database query needed.
+  const assignmentsByArmband = useMemo(() => {
+    const map = new Map();
+
+    assignments.forEach((assignment) => {
+      const key = normalizeArmbandId(assignment.armbandID);
+
+      if (!key) {
+        return;
+      }
+
+      if (!map.has(key)) {
+        map.set(key, []);
+      }
+      map.get(key).push(assignment);
+    });
+
+    map.forEach((list) => list.sort(byNewestAssignment));
+    return map;
+  }, [assignments]);
+
+  // Alerts enriched with the guest assigned to the armband that raised them.
+  const alertsWithGuests = useMemo(
+    () => alerts.map((alert) => withGuestDetails(alert, assignmentsByArmband)),
+    [alerts, assignmentsByArmband]
+  );
+
   // Alert Logs table: severity and alert-type filters only narrow which rows
   // show up. Ordering is "pinned fresh Criticals first (under 5 minutes old),
   // then strictly newest first". nowMs is a dependency so the pin expires on
@@ -1011,22 +1131,24 @@ export default function AdminDashboard() {
   const filteredAlerts = useMemo(() => {
     const byFilter =
       activeAlertTab === 'All'
-        ? alerts
+        ? alertsWithGuests
         : activeAlertTab === 'Camera'
-          ? alerts.filter((alert) => isCameraAlert(alert))
+          ? alertsWithGuests.filter((alert) => isCameraAlert(alert))
           : activeAlertTab === 'Armband'
-            ? alerts.filter((alert) => !isCameraAlert(alert))
-            : alerts.filter((alert) => alert.alertlevel === activeAlertTab);
+            ? alertsWithGuests.filter((alert) => !isCameraAlert(alert))
+            : alertsWithGuests.filter(
+                (alert) => alert.alertlevel === activeAlertTab
+              );
 
     return [...byFilter].sort(byPinThenNewest(nowMs));
-  }, [alerts, activeAlertTab, nowMs]);
+  }, [alertsWithGuests, activeAlertTab, nowMs]);
 
   // Dashboard preview: open alerts only, same ordering as the log table.
   const openAlertsPreview = useMemo(() => {
-    return alerts
+    return alertsWithGuests
       .filter((alert) => alert.status === 'Open')
       .sort(byPinThenNewest(nowMs));
-  }, [alerts, nowMs]);
+  }, [alertsWithGuests, nowMs]);
 
   // Alerts filtered to the selected period and bucketed for the trend chart.
   // nowMs is a dependency so the chart rolls forward on the clock tick.
@@ -1096,7 +1218,7 @@ export default function AdminDashboard() {
       const currentHolder = latestAssignments.find(
         (item) =>
           isHeldAssignment(item) &&
-          String(item.armbandID ?? '').trim().toUpperCase() === armbandID
+          normalizeArmbandId(item.armbandID) === normalizeArmbandId(armbandID)
       );
 
       if (currentHolder) {
