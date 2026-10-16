@@ -2,7 +2,7 @@
 
 **Caribbean Waves Safety Operations**
 
-AquaGuard is an IoT and AI camera-assisted waterpark safety dashboard for real-time drowning detection, emergency alert management, and guest armband tracking. ESP32 wearable armbands and AI camera detections stream alerts into Firebase, and the operator dashboard turns them into a prioritized, always-live picture of what needs attention right now.
+AquaGuard is an IoT enabled wearable arm device with AI camera-based image processing for real-time drowning detection, emergency alert management, and guest armband tracking. The wearable armbands and AI camera detections stream alerts into Firebase, and the dashboard turns them into a prioritized, always-live picture of what needs attention right now.
 
 ## Tech Stack
 
@@ -11,7 +11,7 @@ AquaGuard is an IoT and AI camera-assisted waterpark safety dashboard for real-t
 - **Date Handling:** date-fns
 - **Backend / Database:** Firebase Realtime Database (live `/alerts`, `/assignments` and `/inventory` streams)
 - **Hardware Integration:** ESP32 wearable armbands (heartbeat / status tracking) and AI camera feed integration
-- **Authentication:** Admin login (`AdminLogin.jsx`) plus an anonymous Firebase session used by the database security rules
+- **Access:** Direct dashboard access. The app opens straight into `AdminDashboard.jsx` with no login screen. `firebase.js` signs each browser session in anonymously so the database security rules can require `auth != null`.
 
 ## Key Features
 
@@ -53,8 +53,7 @@ AquaGuard is an IoT and AI camera-assisted waterpark safety dashboard for real-t
 │   │   ├── config/
 │   │   │   └── firebase.js     # Firebase initialisation (Auth + Realtime Database)
 │   │   ├── pages/
-│   │   │   ├── AdminDashboard.jsx
-│   │   │   └── AdminLogin.jsx
+│   │   │   └── AdminDashboard.jsx
 │   │   ├── App.jsx
 │   │   ├── main.jsx
 │   │   └── index.css
@@ -120,7 +119,7 @@ Notes:
 npm run dev
 ```
 
-Visit [http://localhost:5173](http://localhost:5173).
+Visit [http://localhost:5173](http://localhost:5173). The app opens directly into the AquaGuard dashboard.
 
 For a production build, run `npm run build`.
 
@@ -229,14 +228,4 @@ Open the Firebase Console → **Realtime Database → Rules**.
 }
 ```
 
-The app signs in anonymously on load, so `auth != null` is satisfied by the dashboard itself. Keep in mind that any visitor who can load the app also gets an anonymous session. Before a real deployment, restrict access further (for example with Firebase email/password authentication and rules based on the signed-in user), and make sure the ESP32 devices and AI camera service write to the database with credentials your rules allow.
-
-## Admin Login
-
-Access to the monitoring dashboard goes through the admin login screen, implemented in `client/src/pages/AdminLogin.jsx`.
-
-<!-- TODO: document how AdminLogin.jsx is configured: where the admin credentials come from (hard-coded prototype credentials vs. Firebase email/password), the route used for the login page, and where the dashboard redirects after a successful login. -->
-
-Notes:
-- The anonymous Firebase session created in `firebase.js` is separate from the admin login. It only lets the browser talk to the database under the `auth != null` rules.
-- Change any prototype credentials and tighten the database rules before using the system in production.
+The app signs in anonymously on load, so `auth != null` is satisfied by the dashboard itself. Because there is no login screen, anyone who can reach the deployed app also gets an anonymous session and full dashboard access. Before a real deployment, restrict who can open the app (for example with hosting-level access control, or Firebase email/password authentication with rules based on the signed-in user), and make sure the ESP32 devices and AI camera service write to the database with credentials your rules allow.
